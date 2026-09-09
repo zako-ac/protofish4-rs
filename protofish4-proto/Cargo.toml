@@ -9,4 +9,4 @@ description = "Sans-IO core of protofish4: framing, AEAD, gap tracking and retra
 chacha20poly1305 = "0.11.0"
 thiserror = "2"
 tracing = "0.1"
-uuid = { version = "1.26.0", features = ["v4"] }
+uuid = { version = "1", features = ["v4"] }
