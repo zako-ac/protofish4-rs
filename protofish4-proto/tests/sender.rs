@@ -198,6 +198,56 @@ fn no_ack_at_all_fails_the_transfer() {
     assert!(tx.is_done());
 }
 
+/// A sender held back by the receiver's buffer report has nothing to say — and
+/// silence is what the receiver's idle timeout reads as a dead tap, after which
+/// it aborts the transfer and stops acknowledging, leaving the pause permanent.
+/// The pause is therefore spoken for.
+#[test]
+fn a_paused_sender_keeps_the_transfer_alive() {
+    let t0 = Instant::now();
+    let cfg = SenderConfig {
+        tail_keepalive_interval: Duration::from_secs(1),
+        buffer_high_water_ms: 1_000,
+        buffer_low_water_ms: 500,
+        ..Default::default()
+    };
+    let mut tx = XferSender::new(cfg);
+    assert!(send_one(&mut tx, t0).is_some());
+
+    // The receiver says its buffer is full, so the sender stops.
+    let acked = tx.handle(
+        Body::Ack {
+            contiguous: XferSeq(1),
+            highest: XferSeq(1),
+            buffered_ms: 60_000,
+        },
+        t0,
+    );
+    assert!(acked.is_empty());
+    assert!(!tx.can_send(), "the brake should have engaged");
+
+    // Nothing to send, but still alive.
+    let events = tx.tick(t0 + Duration::from_secs(2));
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            SendEvent::Emit { body: Body::Keepalive { .. }, .. }
+        )),
+        "a paused sender must say it is still here: {events:?}"
+    );
+
+    // And a later, lower report releases it.
+    tx.handle(
+        Body::Ack {
+            contiguous: XferSeq(1),
+            highest: XferSeq(1),
+            buffered_ms: 0,
+        },
+        t0 + Duration::from_secs(2),
+    );
+    assert!(tx.can_send(), "the sender must resume once the buffer drains");
+}
+
 /// Overflowing the ring is not an error — it just means those frames can no
 /// longer be recovered, and the receiver is told so it can stop asking.
 #[test]

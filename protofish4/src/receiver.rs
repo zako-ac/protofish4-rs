@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use protofish4_proto::codec::{decode_body, encode_body};
 use protofish4_proto::config::ReceiverConfig;
@@ -57,20 +57,80 @@ pub struct Streams {
 /// `buffer_low_water_ms`. Nothing in the transfer layer can compute that — only
 /// the component that plays the audio knows how much of it is queued — so the
 /// value is written here and read when an acknowledgement is sealed.
-#[derive(Clone, Debug, Default)]
+///
+/// A report is a measurement of a moving target, so it is also dated: see
+/// [`BufferFeedback::fresh_buffered_ms`].
+#[derive(Clone, Debug)]
 pub struct BufferFeedback {
-    ms: Arc<AtomicU64>,
+    inner: Arc<FeedbackInner>,
+}
+
+#[derive(Debug)]
+struct FeedbackInner {
+    ms: AtomicU64,
+    /// When `ms` was last written, in milliseconds since `epoch`.
+    written_at_ms: AtomicU64,
+    epoch: Instant,
+}
+
+impl Default for BufferFeedback {
+    fn default() -> Self {
+        Self {
+            inner: Arc::new(FeedbackInner {
+                ms: AtomicU64::new(0),
+                written_at_ms: AtomicU64::new(0),
+                epoch: Instant::now(),
+            }),
+        }
+    }
 }
 
 impl BufferFeedback {
     /// Report the sink's current occupancy, in milliseconds.
     pub fn set_buffered_ms(&self, ms: u64) {
-        self.ms.store(ms, Ordering::Relaxed);
+        self.inner.ms.store(ms, Ordering::Relaxed);
+        let elapsed = self.inner.epoch.elapsed().as_millis() as u64;
+        self.inner.written_at_ms.store(elapsed, Ordering::Relaxed);
     }
 
-    /// The last occupancy reported.
+    /// The last occupancy reported, whether or not it is still current.
     pub fn buffered_ms(&self) -> u64 {
-        self.ms.load(Ordering::Relaxed)
+        self.inner.ms.load(Ordering::Relaxed)
+    }
+
+    /// The occupancy reported, if it was reported within `ttl`.
+    ///
+    /// The sender's only way out of a pause is a later, lower report, so a sink
+    /// that stops reporting — a decoder task that died, a stream that was never
+    /// really playing — would hold the tap back forever. That is worse than it
+    /// sounds: a paused tap sends nothing, so the receiver's idle timeout reads
+    /// the silence as a dead peer, aborts the transfer, and stops acknowledging
+    /// the sender entirely. Dating the report bounds any pause to `ttl` plus an
+    /// ack interval, because an unrenewed report is treated as no report at all.
+    pub fn fresh_buffered_ms(&self, now: Instant, ttl: Duration) -> Option<u64> {
+        let written = Duration::from_millis(self.inner.written_at_ms.load(Ordering::Relaxed));
+        let reported_at = self.inner.epoch + written;
+        (now.duration_since(reported_at) <= ttl).then(|| self.inner.ms.load(Ordering::Relaxed))
+    }
+}
+
+/// How long a sink's report stays actionable before it is treated as absent.
+///
+/// The audio engine renews it on every frame it plays, twenty milliseconds
+/// apart, so a sink that is genuinely backed up never goes stale; one that has
+/// stopped reporting is released within a couple of seconds, far inside the
+/// fifteen-second idle timeout that would otherwise abort the transfer.
+pub const BUFFER_REPORT_TTL: Duration = Duration::from_secs(2);
+
+/// The occupancy to put in an acknowledgement.
+///
+/// The sink's fresh report wins; the state machine's value is the fallback for a
+/// sink that has never reported or has stopped, so the field is never simply
+/// discarded.
+fn ack_buffered_ms(feedback: &BufferFeedback, state_ms: u16, now: Instant) -> u16 {
+    match feedback.fresh_buffered_ms(now, BUFFER_REPORT_TTL) {
+        Some(ms) => ms.min(u16::MAX as u64) as u16,
+        None => state_ms,
     }
 }
 
@@ -262,11 +322,12 @@ impl Endpoint {
                         out.push(d);
                     }
                 }
-                RecvEvent::SendAck { contiguous, highest, .. } => {
+                RecvEvent::SendAck { contiguous, highest, buffered_ms } => {
                     // The occupancy comes from the sink, not from the state
                     // machine: without it every acknowledgement would claim an
                     // empty buffer and the sender would never slow down.
-                    let buffered_ms = entry.feedback.buffered_ms().min(u16::MAX as u64) as u16;
+                    let buffered_ms =
+                        ack_buffered_ms(&entry.feedback, buffered_ms, Instant::now());
                     if let Some(d) = entry.seal(
                         id,
                         Body::Ack { contiguous, highest, buffered_ms },
@@ -365,5 +426,36 @@ mod tests {
             Body::Ack { buffered_ms, .. } => assert_eq!(buffered_ms, 4321),
             other => panic!("expected an ack, got {other:?}"),
         }
+    }
+
+    /// A fresh report is what reaches the wire, not the state machine's own
+    /// (unused) value.
+    #[test]
+    fn a_fresh_report_is_what_goes_on_the_wire() {
+        let feedback = BufferFeedback::default();
+        feedback.set_buffered_ms(4321);
+        assert_eq!(ack_buffered_ms(&feedback, 999, Instant::now()), 4321);
+    }
+
+    /// The field is sixteen bits wide; a sink reporting more must not wrap.
+    #[test]
+    fn an_over_range_report_is_clamped_to_the_wire_limit() {
+        let feedback = BufferFeedback::default();
+        feedback.set_buffered_ms(u64::MAX);
+        assert_eq!(ack_buffered_ms(&feedback, 0, Instant::now()), u16::MAX);
+    }
+
+    /// An unrenewed report stops counting, so a sender cannot be held back
+    /// forever by a sink that has gone quiet — the difference between a pause
+    /// and a wedge.
+    #[test]
+    fn a_stale_report_falls_back_to_the_state_machines_value() {
+        let feedback = BufferFeedback::default();
+        feedback.set_buffered_ms(u64::MAX);
+        let now = Instant::now();
+        assert_eq!(ack_buffered_ms(&feedback, 1234, now), u16::MAX);
+
+        let later = now + BUFFER_REPORT_TTL + Duration::from_millis(1);
+        assert_eq!(ack_buffered_ms(&feedback, 1234, later), 1234);
     }
 }

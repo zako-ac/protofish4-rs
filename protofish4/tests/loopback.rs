@@ -5,7 +5,7 @@
 //! and neither outcome depends on the other.
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -189,6 +189,64 @@ async fn loss_is_recovered_and_the_cache_copy_is_exact() {
     sorted.dedup();
     assert_eq!(sorted.len(), unrel.len(), "playback must never see a duplicate");
     assert!(unrel.len() <= 60);
+}
+
+/// The occupancy report is a brake with a release. A tap held back by a full
+/// buffer has to be let go when the sink stops reporting: the pause is only
+/// meant to be as long as the sink is actually behind, and a sink that has gone
+/// quiet — a dead decoder task — must not keep the tap waiting forever. Before
+/// the report was dated, that pause could never end.
+#[tokio::test]
+async fn a_paused_tap_is_released_when_the_report_goes_stale() {
+    let (sink_key, tap_key) = key_pair();
+    let id = RequestId::random();
+    let (sink_addr, _armed, streams) =
+        armed_sink(ReceiverConfig::audio_engine(), sink_key, id).await;
+
+    // Report a full buffer, then go quiet: the decoder died mid-track.
+    let feedback = streams.feedback.clone();
+    let reporting = Arc::new(AtomicBool::new(true));
+    let reporter = {
+        let feedback = feedback.clone();
+        let reporting = Arc::clone(&reporting);
+        tokio::spawn(async move {
+            while reporting.load(Ordering::Relaxed) {
+                feedback.set_buffered_ms(60_000);
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+    };
+
+    let send = tokio::spawn(protofish4::send_all(
+        vec![sink_addr.to_string()],
+        id,
+        tap_key,
+        SenderConfig {
+            max_outstanding: 4,
+            buffer_high_water_ms: 1_000,
+            buffer_low_water_ms: 500,
+            ..Default::default()
+        },
+        frames(40),
+    ));
+
+    // Let the brake engage, then take the report away.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert!(
+        !send.is_finished(),
+        "a tap reporting a full buffer must be held back"
+    );
+    reporting.store(false, Ordering::Relaxed);
+
+    let (unrel, rel, outcome) = collect(streams).await;
+    send.await
+        .unwrap()
+        .expect("the tap must be released, not wedged");
+    reporter.abort();
+
+    assert_eq!(rel.len(), 40, "the whole track arrives once released");
+    assert_eq!(unrel.len(), 40);
+    assert!(matches!(outcome, Some(RelOutcome::Complete { .. })));
 }
 
 /// A request the endpoint never armed is dropped without disturbing anything.

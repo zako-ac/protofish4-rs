@@ -129,8 +129,10 @@ pub struct SenderConfig {
     /// latency cost.
     pub first_ack_timeout: Duration,
 
-    /// Keepalive cadence between `End` and `EndAck`, while the sender has
-    /// nothing to send but must keep its NAT mapping open for NACKs.
+    /// Keepalive cadence while the sender has nothing to send but must stay
+    /// alive: between `End` and `EndAck`, and while paused by the receiver's
+    /// buffer report. Both cases would otherwise look like a dead tap to the
+    /// receiver's idle timeout.
     pub tail_keepalive_interval: Duration,
 
     /// Give up waiting for `EndAck` after this.
