@@ -192,6 +192,26 @@ impl XferSender {
             return out;
         }
 
+        // A sender held back by the receiver's buffer report has nothing to
+        // send either, and the receiver cannot tell that silence from a tap
+        // that died: its idle timeout fires, the transfer aborts with
+        // `PeerGone`, and from then on nothing acknowledges the tap — so the
+        // pause becomes permanent. A keepalive says "still here, still
+        // holding"; the receiver records it as liveness and nothing else.
+        if self.state == State::Streaming && self.paused {
+            let due = match self.last_keepalive_at {
+                Some(last) => now.duration_since(last) >= self.cfg.tail_keepalive_interval,
+                None => true,
+            };
+            if due {
+                self.last_keepalive_at = Some(now);
+                out.push(SendEvent::Emit {
+                    seq: self.control_seq(),
+                    body: Body::Keepalive { lost_below: self.ring.lost_below() },
+                });
+            }
+        }
+
         if self.state == State::Finalizing {
             if let Some(started) = self.finalize_at
                 && now.duration_since(started) > self.cfg.finalize_timeout
