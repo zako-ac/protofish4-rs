@@ -50,16 +50,18 @@ pub struct Streams {
     pub feedback: BufferFeedback,
 }
 
-/// Milliseconds of audio the sink is holding, as told to [`Endpoint`].
+/// Where playback has reached, as told to [`Endpoint`].
 ///
 /// The occupancy reported in [`Body::Ack`] is what paces a tap: the sender
-/// pauses above `buffer_high_water_ms` and resumes below
-/// `buffer_low_water_ms`. Nothing in the transfer layer can compute that — only
-/// the component that plays the audio knows how much of it is queued — so the
-/// value is written here and read when an acknowledgement is sealed.
+/// pauses above `buffer_high_water_ms` and resumes below `buffer_low_water_ms`.
+/// A sink cannot measure that itself — the frames it would have to count are
+/// spread across queues it does not own, in this endpoint as much as in the
+/// application — so it reports the one thing only it knows, the timestamp it is
+/// playing, and the endpoint subtracts that from the newest frame it has
+/// received. Everything unplayed is then accounted for, wherever it waits.
 ///
 /// A report is a measurement of a moving target, so it is also dated: see
-/// [`BufferFeedback::fresh_buffered_ms`].
+/// [`BufferFeedback::fresh_playhead_ms`].
 #[derive(Clone, Debug)]
 pub struct BufferFeedback {
     inner: Arc<FeedbackInner>,
@@ -67,8 +69,8 @@ pub struct BufferFeedback {
 
 #[derive(Debug)]
 struct FeedbackInner {
-    ms: AtomicU64,
-    /// When `ms` was last written, in milliseconds since `epoch`.
+    playhead_ms: AtomicU64,
+    /// When `playhead_ms` was last written, in milliseconds since `epoch`.
     written_at_ms: AtomicU64,
     epoch: Instant,
 }
@@ -77,7 +79,7 @@ impl Default for BufferFeedback {
     fn default() -> Self {
         Self {
             inner: Arc::new(FeedbackInner {
-                ms: AtomicU64::new(0),
+                playhead_ms: AtomicU64::new(0),
                 written_at_ms: AtomicU64::new(0),
                 epoch: Instant::now(),
             }),
@@ -86,31 +88,35 @@ impl Default for BufferFeedback {
 }
 
 impl BufferFeedback {
-    /// Report the sink's current occupancy, in milliseconds.
-    pub fn set_buffered_ms(&self, ms: u64) {
-        self.inner.ms.store(ms, Ordering::Relaxed);
+    /// Report the timestamp playback has reached, in milliseconds.
+    pub fn set_playhead_ms(&self, ms: u64) {
+        self.inner.playhead_ms.store(ms, Ordering::Relaxed);
         let elapsed = self.inner.epoch.elapsed().as_millis() as u64;
         self.inner.written_at_ms.store(elapsed, Ordering::Relaxed);
     }
 
-    /// The last occupancy reported, whether or not it is still current.
-    pub fn buffered_ms(&self) -> u64 {
-        self.inner.ms.load(Ordering::Relaxed)
+    /// The last play head reported, whether or not it is still current.
+    pub fn playhead_ms(&self) -> u64 {
+        self.inner.playhead_ms.load(Ordering::Relaxed)
     }
 
-    /// The occupancy reported, if it was reported within `ttl`.
+    /// The play head reported, if it was reported within `ttl`.
     ///
-    /// The sender's only way out of a pause is a later, lower report, so a sink
-    /// that stops reporting — a decoder task that died, a stream that was never
-    /// really playing — would hold the tap back forever. That is worse than it
-    /// sounds: a paused tap sends nothing, so the receiver's idle timeout reads
-    /// the silence as a dead peer, aborts the transfer, and stops acknowledging
-    /// the sender entirely. Dating the report bounds any pause to `ttl` plus an
-    /// ack interval, because an unrenewed report is treated as no report at all.
-    pub fn fresh_buffered_ms(&self, now: Instant, ttl: Duration) -> Option<u64> {
+    /// The sender's only way out of a pause is a later, lower occupancy, so a
+    /// sink that stops reporting — a decoder task that died, a stream that was
+    /// never really playing — would hold the tap back forever. That is worse
+    /// than it sounds: a paused tap sends nothing, so the receiver's idle
+    /// timeout reads the silence as a dead peer, aborts the transfer, and stops
+    /// acknowledging the sender entirely. Dating the report bounds any pause to
+    /// `ttl` plus an ack interval, because an unrenewed report is treated as no
+    /// report at all.
+    pub fn fresh_playhead_ms(&self, now: Instant, ttl: Duration) -> Option<u64> {
         let written = Duration::from_millis(self.inner.written_at_ms.load(Ordering::Relaxed));
         let reported_at = self.inner.epoch + written;
-        (now.duration_since(reported_at) <= ttl).then(|| self.inner.ms.load(Ordering::Relaxed))
+        if now.duration_since(reported_at) > ttl {
+            return None;
+        }
+        Some(self.inner.playhead_ms.load(Ordering::Relaxed))
     }
 }
 
@@ -122,14 +128,28 @@ impl BufferFeedback {
 /// fifteen-second idle timeout that would otherwise abort the transfer.
 pub const BUFFER_REPORT_TTL: Duration = Duration::from_secs(2);
 
+/// How often a transport that has to discard playback frames may say so.
+const DROP_WARN_INTERVAL: Duration = Duration::from_secs(5);
+
 /// The occupancy to put in an acknowledgement.
 ///
-/// The sink's fresh report wins; the state machine's value is the fallback for a
-/// sink that has never reported or has stopped, so the field is never simply
-/// discarded.
-fn ack_buffered_ms(feedback: &BufferFeedback, state_ms: u16, now: Instant) -> u16 {
-    match feedback.fresh_buffered_ms(now, BUFFER_REPORT_TTL) {
-        Some(ms) => ms.min(u16::MAX as u64) as u16,
+/// What the sink has left to play is everything that arrived and has not been
+/// played: the newest frame this endpoint has received, minus the play head the
+/// sink reported. Measuring it here rather than in the sink is what makes the
+/// number cover frames queued in this endpoint as well as in the application —
+/// a sink counting only what it had dequeued would top out at its own pipeline
+/// and never reach the sender's water marks.
+///
+/// The state machine's value is the fallback for a sink that has never reported
+/// or has gone quiet, so the field is never simply discarded.
+fn ack_buffered_ms(
+    feedback: &BufferFeedback,
+    state_ms: u16,
+    newest_data_ms: u64,
+    now: Instant,
+) -> u16 {
+    match feedback.fresh_playhead_ms(now, BUFFER_REPORT_TTL) {
+        Some(playhead) => newest_data_ms.saturating_sub(playhead).min(u16::MAX as u64) as u16,
         None => state_ms,
     }
 }
@@ -144,8 +164,18 @@ struct Entry {
     unrel_tx: mpsc::Sender<Frame>,
     rel_tx: mpsc::Sender<Frame>,
     outcome_tx: Option<tokio::sync::oneshot::Sender<RelOutcome>>,
-    /// The sink's occupancy report, as handed out in [`Streams::feedback`].
+    /// The sink's play head, as handed out in [`Streams::feedback`].
     feedback: BufferFeedback,
+    /// Timestamp of the newest playback frame this endpoint has received.
+    ///
+    /// A maximum rather than a latest: the unreliable stream reorders, and a
+    /// late arrival must not make the sender look further ahead than it is.
+    newest_data_ms: u64,
+    /// Playback frames the transport had to discard because the sink was not
+    /// draining fast enough. Uncounted, such a drop is invisible: the sender is
+    /// never told and the application never sees the frame.
+    dropped_unrel: u64,
+    last_drop_warn: Option<Instant>,
 }
 
 /// A bound UDP socket serving any number of transfers.
@@ -198,6 +228,9 @@ impl Endpoint {
                 rel_tx,
                 outcome_tx: Some(outcome_tx),
                 feedback: feedback.clone(),
+                newest_data_ms: 0,
+                dropped_unrel: 0,
+                last_drop_warn: None,
             },
         );
         drop(entries);
@@ -298,16 +331,35 @@ impl Endpoint {
         for ev in events {
             match ev {
                 RecvEvent::Unreliable(f) => {
+                    entry.newest_data_ms = entry.newest_data_ms.max(f.ts.0);
                     // Playback must never be held up by a slow consumer; a full
                     // channel means the listener is behind and the frame is
                     // already stale.
-                    let _ = entry.unrel_tx.try_send(Frame {
-                        seq: f.seq,
-                        ts: f.ts,
-                        payload: f.payload,
-                    });
+                    if entry
+                        .unrel_tx
+                        .try_send(Frame {
+                            seq: f.seq,
+                            ts: f.ts,
+                            payload: f.payload,
+                        })
+                        .is_err()
+                    {
+                        entry.dropped_unrel += 1;
+                        let now = Instant::now();
+                        if entry
+                            .last_drop_warn
+                            .is_none_or(|last| now.duration_since(last) >= DROP_WARN_INTERVAL)
+                        {
+                            entry.last_drop_warn = Some(now);
+                            tracing::warn!(
+                                dropped = entry.dropped_unrel,
+                                "playback frame dropped: the sink is not draining the transport"
+                            );
+                        }
+                    }
                 }
                 RecvEvent::Reliable(f) => {
+                    entry.newest_data_ms = entry.newest_data_ms.max(f.ts.0);
                     if entry
                         .rel_tx
                         .send(Frame { seq: f.seq, ts: f.ts, payload: f.payload })
@@ -326,8 +378,12 @@ impl Endpoint {
                     // The occupancy comes from the sink, not from the state
                     // machine: without it every acknowledgement would claim an
                     // empty buffer and the sender would never slow down.
-                    let buffered_ms =
-                        ack_buffered_ms(&entry.feedback, buffered_ms, Instant::now());
+                    let buffered_ms = ack_buffered_ms(
+                        &entry.feedback,
+                        buffered_ms,
+                        entry.newest_data_ms,
+                        Instant::now(),
+                    );
                     if let Some(d) = entry.seal(
                         id,
                         Body::Ack { contiguous, highest, buffered_ms },
@@ -404,45 +460,52 @@ mod tests {
         let ack_interval = cfg.ack_interval;
 
         let (_armed, streams) = endpoint.arm(id, key.clone(), cfg).await.unwrap();
-        streams.feedback.set_buffered_ms(4321);
+        // Playback has reached 1 s; the frame that arrives is timestamped 5.32 s.
+        streams.feedback.set_playhead_ms(1_000);
 
         let now = Instant::now();
         let mut entries = endpoint.entries.lock().await;
         let entry = entries.get_mut(&id).expect("the request was armed");
-        entry.state.handle(
+        // The arrival has to be applied, not merely handled: recording the
+        // newest timestamp is the endpoint's job, and the occupancy is measured
+        // against it.
+        let mut events = entry.state.handle(
             XferSeq(1),
-            Body::Data { ts: TimestampMs(20), payload: vec![7; 40] },
+            Body::Data { ts: TimestampMs(5_320), payload: vec![7; 40] },
             now,
         );
 
         // Past the ack interval, so the receiver has something to acknowledge.
-        let events = entry.state.tick(now + ack_interval + Duration::from_millis(1));
+        events.extend(entry.state.tick(now + ack_interval + Duration::from_millis(1)));
         let datagrams = Endpoint::apply(entry, id, events).await;
         drop(entries);
 
         let datagram = datagrams.first().expect("an ack was sealed");
         let (header, plaintext) = crypto::open(&key, datagram, Direction::Recv).expect("opens");
         match decode_body(header.kind, &plaintext).expect("decodes") {
-            Body::Ack { buffered_ms, .. } => assert_eq!(buffered_ms, 4321),
+            Body::Ack { buffered_ms, .. } => assert_eq!(buffered_ms, 4_320),
             other => panic!("expected an ack, got {other:?}"),
         }
     }
 
-    /// A fresh report is what reaches the wire, not the state machine's own
-    /// (unused) value.
+    /// The occupancy is what arrived but has not been played, measured against
+    /// the sink's play head.
     #[test]
-    fn a_fresh_report_is_what_goes_on_the_wire() {
+    fn a_fresh_play_head_is_what_goes_on_the_wire() {
         let feedback = BufferFeedback::default();
-        feedback.set_buffered_ms(4321);
-        assert_eq!(ack_buffered_ms(&feedback, 999, Instant::now()), 4321);
+        feedback.set_playhead_ms(1_000);
+        assert_eq!(ack_buffered_ms(&feedback, 999, 5_321, Instant::now()), 4_321);
     }
 
-    /// The field is sixteen bits wide; a sink reporting more must not wrap.
+    /// The field is sixteen bits wide; a long backlog must not wrap.
     #[test]
-    fn an_over_range_report_is_clamped_to_the_wire_limit() {
+    fn an_over_range_backlog_is_clamped_to_the_wire_limit() {
         let feedback = BufferFeedback::default();
-        feedback.set_buffered_ms(u64::MAX);
-        assert_eq!(ack_buffered_ms(&feedback, 0, Instant::now()), u16::MAX);
+        feedback.set_playhead_ms(0);
+        assert_eq!(
+            ack_buffered_ms(&feedback, 0, u64::MAX, Instant::now()),
+            u16::MAX
+        );
     }
 
     /// An unrenewed report stops counting, so a sender cannot be held back
@@ -451,11 +514,11 @@ mod tests {
     #[test]
     fn a_stale_report_falls_back_to_the_state_machines_value() {
         let feedback = BufferFeedback::default();
-        feedback.set_buffered_ms(u64::MAX);
+        feedback.set_playhead_ms(0);
         let now = Instant::now();
-        assert_eq!(ack_buffered_ms(&feedback, 1234, now), u16::MAX);
+        assert_eq!(ack_buffered_ms(&feedback, 1234, 60_000, now), 60_000);
 
         let later = now + BUFFER_REPORT_TTL + Duration::from_millis(1);
-        assert_eq!(ack_buffered_ms(&feedback, 1234, later), 1234);
+        assert_eq!(ack_buffered_ms(&feedback, 1234, 60_000, later), 1234);
     }
 }

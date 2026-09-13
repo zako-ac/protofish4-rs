@@ -211,7 +211,8 @@ async fn a_paused_tap_is_released_when_the_report_goes_stale() {
         let reporting = Arc::clone(&reporting);
         tokio::spawn(async move {
             while reporting.load(Ordering::Relaxed) {
-                feedback.set_buffered_ms(60_000);
+                // Playback has not started: everything received is backlog.
+                feedback.set_playhead_ms(0);
                 tokio::time::sleep(Duration::from_millis(25)).await;
             }
         })
