@@ -8,6 +8,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use protofish4_proto::codec::{decode_body, encode_body};
@@ -41,6 +42,36 @@ pub struct Streams {
     pub unrel: mpsc::Receiver<Frame>,
     pub rel: mpsc::Receiver<Frame>,
     pub outcome: tokio::sync::oneshot::Receiver<RelOutcome>,
+    /// Where the sink reports how much audio it is holding.
+    ///
+    /// The receiving state machine knows which sequence numbers arrived; it has
+    /// no idea how far behind playback is running, and that is the number the
+    /// sender's high/low-water brake acts on. See [`BufferFeedback`].
+    pub feedback: BufferFeedback,
+}
+
+/// Milliseconds of audio the sink is holding, as told to [`Endpoint`].
+///
+/// The occupancy reported in [`Body::Ack`] is what paces a tap: the sender
+/// pauses above `buffer_high_water_ms` and resumes below
+/// `buffer_low_water_ms`. Nothing in the transfer layer can compute that — only
+/// the component that plays the audio knows how much of it is queued — so the
+/// value is written here and read when an acknowledgement is sealed.
+#[derive(Clone, Debug, Default)]
+pub struct BufferFeedback {
+    ms: Arc<AtomicU64>,
+}
+
+impl BufferFeedback {
+    /// Report the sink's current occupancy, in milliseconds.
+    pub fn set_buffered_ms(&self, ms: u64) {
+        self.ms.store(ms, Ordering::Relaxed);
+    }
+
+    /// The last occupancy reported.
+    pub fn buffered_ms(&self) -> u64 {
+        self.ms.load(Ordering::Relaxed)
+    }
 }
 
 struct Entry {
@@ -53,6 +84,8 @@ struct Entry {
     unrel_tx: mpsc::Sender<Frame>,
     rel_tx: mpsc::Sender<Frame>,
     outcome_tx: Option<tokio::sync::oneshot::Sender<RelOutcome>>,
+    /// The sink's occupancy report, as handed out in [`Streams::feedback`].
+    feedback: BufferFeedback,
 }
 
 /// A bound UDP socket serving any number of transfers.
@@ -88,6 +121,7 @@ impl Endpoint {
         let (unrel_tx, unrel) = mpsc::channel(256);
         let (rel_tx, rel) = mpsc::channel(256);
         let (outcome_tx, outcome) = tokio::sync::oneshot::channel();
+        let feedback = BufferFeedback::default();
 
         let mut entries = self.entries.lock().await;
         if entries.contains_key(&request_id) {
@@ -103,13 +137,14 @@ impl Endpoint {
                 unrel_tx,
                 rel_tx,
                 outcome_tx: Some(outcome_tx),
+                feedback: feedback.clone(),
             },
         );
         drop(entries);
 
         Ok((
             ArmedRequest { endpoint: Arc::clone(self), request_id },
-            Streams { unrel, rel, outcome },
+            Streams { unrel, rel, outcome, feedback },
         ))
     }
 
@@ -227,10 +262,15 @@ impl Endpoint {
                         out.push(d);
                     }
                 }
-                RecvEvent::SendAck { contiguous, highest, buffered_ms } => {
-                    if let Some(d) =
-                        entry.seal(id, Body::Ack { contiguous, highest, buffered_ms })
-                    {
+                RecvEvent::SendAck { contiguous, highest, .. } => {
+                    // The occupancy comes from the sink, not from the state
+                    // machine: without it every acknowledgement would claim an
+                    // empty buffer and the sender would never slow down.
+                    let buffered_ms = entry.feedback.buffered_ms().min(u16::MAX as u64) as u16;
+                    if let Some(d) = entry.seal(
+                        id,
+                        Body::Ack { contiguous, highest, buffered_ms },
+                    ) {
                         out.push(d);
                     }
                 }
@@ -278,5 +318,52 @@ impl Drop for ArmedRequest {
         let endpoint = Arc::clone(&self.endpoint);
         let id = self.request_id;
         tokio::spawn(async move { endpoint.disarm(id).await });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use protofish4_proto::codec::decode_body;
+    use protofish4_proto::crypto;
+    use protofish4_proto::types::Direction;
+
+    use super::*;
+
+    /// The sink's occupancy report is what paces the sender, so it has to reach
+    /// the wire: an acknowledgement sealed while the sink reports a full buffer
+    /// must carry that number, not the state machine's placeholder zero.
+    #[tokio::test]
+    async fn an_ack_carries_the_buffered_ms_the_sink_reported() {
+        let key = SessionKey::from_bytes(&crate::random_key()).unwrap();
+        let endpoint = Endpoint::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let id = RequestId::random();
+        let cfg = ReceiverConfig::audio_engine();
+        let ack_interval = cfg.ack_interval;
+
+        let (_armed, streams) = endpoint.arm(id, key.clone(), cfg).await.unwrap();
+        streams.feedback.set_buffered_ms(4321);
+
+        let now = Instant::now();
+        let mut entries = endpoint.entries.lock().await;
+        let entry = entries.get_mut(&id).expect("the request was armed");
+        entry.state.handle(
+            XferSeq(1),
+            Body::Data { ts: TimestampMs(20), payload: vec![7; 40] },
+            now,
+        );
+
+        // Past the ack interval, so the receiver has something to acknowledge.
+        let events = entry.state.tick(now + ack_interval + Duration::from_millis(1));
+        let datagrams = Endpoint::apply(entry, id, events).await;
+        drop(entries);
+
+        let datagram = datagrams.first().expect("an ack was sealed");
+        let (header, plaintext) = crypto::open(&key, datagram, Direction::Recv).expect("opens");
+        match decode_body(header.kind, &plaintext).expect("decodes") {
+            Body::Ack { buffered_ms, .. } => assert_eq!(buffered_ms, 4321),
+            other => panic!("expected an ack, got {other:?}"),
+        }
     }
 }

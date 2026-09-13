@@ -12,7 +12,7 @@ pub mod receiver;
 pub mod sender;
 
 pub use error::{Error, Result};
-pub use receiver::{ArmedRequest, Endpoint, Frame, Streams};
+pub use receiver::{ArmedRequest, BufferFeedback, Endpoint, Frame, Streams};
 pub use sender::{random_key, send_all, Sender};
 
 pub use protofish4_proto as proto;
